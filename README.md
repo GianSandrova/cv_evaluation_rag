@@ -201,9 +201,3 @@ Kemdian **re-ingest** JD & Rubric karena storage berbeda.
 
 ---
 
-## 9) Lisensi
-
-MIT (opsional)
-
-```
-```
