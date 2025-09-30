@@ -1,7 +1,9 @@
 # src/eval/evaluator.py
 from __future__ import annotations
 
+import os
 import json
+import logging
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, ValidationError
@@ -11,6 +13,18 @@ from src.llm.groq_client import call_groq
 from src.models.embedder import embed_texts
 from src.storage.qdrant_store import query_topk
 from src.retrieval.memory_index import MemoryIndex, build_index_from_files
+from src.utils.logs import setup_logging, short, hr
+
+
+# =======================
+# Logging flags
+# =======================
+LOGGER = setup_logging("evaluator")
+
+EVAL_LOG = os.getenv("EVAL_LOG", "0") == "1"          # log retrieval context + final compact result
+LOG_LLM_RAW = os.getenv("LOG_LLM_RAW", "0") == "1"    # log raw LLM responses (beware of PII)
+LOG_SNIPPET_CHARS = int(os.getenv("LOG_SNIPPET_CHARS", "240"))
+LOG_RETRIEVAL_TOPK = int(os.getenv("LOG_RETRIEVAL_TOPK", "3"))
 
 
 # =======================
@@ -122,12 +136,33 @@ def _retrieve(
     rubric_cv_text = "\n\n".join(rub_cv_hits["documents"][0])[:4000] if rub_cv_hits["documents"][0] else ""
     rubric_prj_text = "\n\n".join(rub_prj_hits["documents"][0])[:4000] if rub_prj_hits["documents"][0] else ""
 
+    cv_evidence = _hits_to_evidence(cv_hits)
+    project_evidence = _hits_to_evidence(prj_hits)
+
+    if EVAL_LOG:
+        LOGGER.info(hr("RETRIEVAL SUMMARY"))
+        LOGGER.info("job_text: %s", "yes" if job_text else "no")
+        LOGGER.info("rubric_cv: %s | rubric_project: %s",
+                    "yes" if rubric_cv_text else "no",
+                    "yes" if rubric_prj_text else "no")
+
+        def _preview(ev_list, label):
+            if not ev_list:
+                LOGGER.info("%s: none", label); return
+            LOGGER.info("%s (top %d):", label, min(LOG_RETRIEVAL_TOPK, len(ev_list)))
+            for i, ev in enumerate(ev_list[:LOG_RETRIEVAL_TOPK], 1):
+                LOGGER.info("  #%d file=%s id=%s\n     %s",
+                            i, ev.get("filename"), ev.get("chunk_id"),
+                            short(ev.get("snippet", ""), LOG_SNIPPET_CHARS))
+        _preview(cv_evidence, "cv_evidence")
+        _preview(project_evidence, "project_evidence")
+
     return {
         "job_text": job_text,
         "rubric_cv": rubric_cv_text,
         "rubric_project": rubric_prj_text,
-        "cv_evidence": _hits_to_evidence(cv_hits),
-        "project_evidence": _hits_to_evidence(prj_hits),
+        "cv_evidence": cv_evidence,
+        "project_evidence": project_evidence,
     }
 
 
@@ -139,42 +174,42 @@ def _build_messages(ctx: Dict[str, Any]) -> List[Dict[str, str]]:
     SYSTEM = (
         "You are a strict recruitment screening assistant.\n"
         "Use ONLY the provided evidence (Job Description, rubric, candidate CV & project snippets).\n"
-        "Score strictly according to the rubric, penalize missing or unclear evidence.\n"
-        "Return ONLY valid JSON. Do not include explanations outside JSON."
+        "Score strictly according to the rubric; if evidence is missing/unclear, score conservatively.\n"
+        "Return ONLY valid JSON according to the requested schema; do not include any text outside JSON."
     )
 
     # Schema hint to guide the LLM to produce consistent JSON
     schema_hint = {
         "cv": {
             "match_rate": "0..1 (weighted from 1..5 rubric dimensions below)",
-            "feedback": "2-4 sentences",
+            "feedback": "2-4 sentences, concise and evidence-based",
             "dimensions": [
-                {"name": "Technical Skills Match", "weight": 0.40, "score": "1..5", "rationale": "...", "evidence": []},
-                {"name": "Experience Level", "weight": 0.25, "score": "1..5", "rationale": "...", "evidence": []},
-                {"name": "Relevant Achievements", "weight": 0.20, "score": "1..5", "rationale": "...", "evidence": []},
-                {"name": "Cultural / Collaboration Fit", "weight": 0.15, "score": "1..5", "rationale": "...", "evidence": []},
+                {"name": "Technical Skills Match", "weight": 0.40, "score": "1..5", "rationale": "1-2 sentences", "evidence": []},
+                {"name": "Experience Level",        "weight": 0.25, "score": "1..5", "rationale": "1-2 sentences", "evidence": []},
+                {"name": "Relevant Achievements",   "weight": 0.20, "score": "1..5", "rationale": "1-2 sentences", "evidence": []},
+                {"name": "Cultural / Collaboration Fit","weight": 0.15, "score": "1..5", "rationale": "1-2 sentences", "evidence": []},
             ],
         },
         "project": {
-            "feedback": "2-4 sentences",
+            "feedback": "2-4 sentences, concise and evidence-based",
             "dimensions": [
-                {"name": "Correctness (Prompt & Chaining)", "weight": 0.30, "score": "1..5", "rationale": "...", "evidence": []},
-                {"name": "Code Quality & Structure", "weight": 0.25, "score": "1..5", "rationale": "...", "evidence": []},
-                {"name": "Resilience & Error Handling", "weight": 0.20, "score": "1..5", "rationale": "...", "evidence": []},
-                {"name": "Documentation & Explanation", "weight": 0.15, "score": "1..5", "rationale": "...", "evidence": []},
-                {"name": "Creativity / Bonus", "weight": 0.10, "score": "1..5", "rationale": "...", "evidence": []},
+                {"name": "Correctness (Prompt & Chaining)", "weight": 0.30, "score": "1..5", "rationale": "1-2 sentences", "evidence": []},
+                {"name": "Code Quality & Structure",        "weight": 0.25, "score": "1..5", "rationale": "1-2 sentences", "evidence": []},
+                {"name": "Resilience & Error Handling",     "weight": 0.20, "score": "1..5", "rationale": "1-2 sentences", "evidence": []},
+                {"name": "Documentation & Explanation",     "weight": 0.15, "score": "1..5", "rationale": "1-2 sentences", "evidence": []},
+                {"name": "Creativity / Bonus",              "weight": 0.10, "score": "1..5", "rationale": "1-2 sentences", "evidence": []},
             ],
         },
-        "overall_summary": "3-5 sentences",
+        "overall_summary": "3-5 sentences; brief, neutral, grounded in evidence",
         "risks": [],
     }
 
     USER = {
         "instructions": (
-            "Score the candidate strictly against the rubric.\n"
-            "For each dimension, provide a score (1..5), rationale, and 1-3 evidence snippets.\n"
-            "Use only the supplied evidence; if missing, score low and mention it.\n"
-            "Output JSON only."
+            "Evaluate the candidate strictly against the rubric using ONLY the supplied evidence.\n"
+            "For each dimension, produce a score (1..5), a short rationale, and 1-3 evidence snippets.\n"
+            "If relevant evidence is missing, assign a lower score and state that clearly.\n"
+            "Output VALID JSON matching the schema; no extra prose."
         ),
         "job_description": ctx.get("job_text", ""),
         "rubric_cv": ctx.get("rubric_cv", ""),
@@ -204,11 +239,18 @@ def _eval_with_ctx(ctx: Dict[str, Any]) -> Dict[str, Any]:
     messages = _build_messages(ctx)
 
     # Call Groq in JSON mode, fallback once without strict JSON mode if validation fails
-    raw = call_groq(messages, json_mode=True)
+    raw = call_groq(messages, json_mode=True, temperature=0.1)
+    if LOG_LLM_RAW:
+        LOGGER.info(hr("LLM RAW (attempt #1, json_mode=True)"))
+        LOGGER.info("%s", short(raw, 1200))
+
     try:
         obj = LLMResult.model_validate_json(raw)
     except ValidationError:
-        raw2 = call_groq(messages, json_mode=False)
+        raw2 = call_groq(messages, json_mode=False, temperature=0.0)
+        if LOG_LLM_RAW:
+            LOGGER.info(hr("LLM RAW (attempt #2, json_mode=False)"))
+            LOGGER.info("%s", short(raw2, 1200))
         obj = LLMResult.model_validate_json(raw2)
 
     cv_dims = obj.cv.get("dimensions", []) if isinstance(obj.cv, dict) else []
@@ -226,7 +268,7 @@ def _eval_with_ctx(ctx: Dict[str, Any]) -> Dict[str, Any]:
     else:
         decision = "reject"
 
-    return {
+    result = {
         "cv_match_rate": cv_match_rate,
         "cv_feedback": obj.cv.get("feedback", "") if isinstance(obj.cv, dict) else "",
         "project_score": project_score,
@@ -239,6 +281,13 @@ def _eval_with_ctx(ctx: Dict[str, Any]) -> Dict[str, Any]:
         },
         "decision": decision,
     }
+
+    if EVAL_LOG:
+        LOGGER.info(hr("FINAL RESULT (compact)"))
+        LOGGER.info("cv_match_rate=%.2f project_score=%.2f decision=%s",
+                    cv_match_rate, project_score, decision)
+
+    return result
 
 
 # =======================
