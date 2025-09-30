@@ -1,4 +1,4 @@
-# AI Screening Backend — FastAPI × RQ × Qdrant × Groq
+# AI Screening Backend — FastAPI
 
 Backend sederhana untuk **screening kandidat**: upload CV/Project → dibandingkan dengan JD & Rubric → hasil evaluasi terstruktur (JSON) via job asinkron.
 
