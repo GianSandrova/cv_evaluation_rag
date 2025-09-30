@@ -1,0 +1,7 @@
+fastapi>=0.112
+uvicorn>=0.30
+redis>=5.0
+rq>=1.16
+python-multipart>=0.0.9
+requests>=2.32
+pydantic>=2.8
